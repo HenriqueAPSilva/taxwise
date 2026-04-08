@@ -1,6 +1,6 @@
 {
   "hosting": {
-    "site": "impostos",
+    "target": "impostos",
     "public": "public",
     "rewrites": [
       {
