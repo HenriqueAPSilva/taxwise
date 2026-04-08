@@ -142,7 +142,17 @@ def default_rates(ctx: Context) -> Dict[str, float]:
 
 
 def build_editor_df(rows: List[Tuple[str, Optional[float], str]]) -> pd.DataFrame:
-    return pd.DataFrame(rows, columns=["Parâmetro", "Valor", "Unidade"])
+    cooked: List[Tuple[str, float, str]] = []
+    for param, value, unit in rows:
+        cooked.append((param, float("nan") if value is None else float(value), unit))
+    return pd.DataFrame(cooked, columns=["Parâmetro", "Valor", "Unidade"])
+
+
+def build_output_df(rows: List[Tuple[str, Optional[float], str]]) -> pd.DataFrame:
+    cooked: List[Tuple[str, str, str]] = []
+    for param, value, unit in rows:
+        cooked.append((param, money(value), unit))
+    return pd.DataFrame(cooked, columns=["Parâmetro", "Valor", "Unidade"])
 
 
 def coerce_map(df: pd.DataFrame) -> Dict[str, Optional[float]]:
@@ -403,27 +413,6 @@ def compute_taxes(ctx: Context, values: Dict[str, Optional[float]]) -> Dict[str,
     }
 
 
-def render_kpis(result: Dict[str, object]) -> None:
-    kpi_cols = st.columns(4)
-    items = [
-        ("Preço base", money(result["base"]), "Referência econômica sem equalização."),
-        ("Preço bruto", money(result["gross"]), "Valor da proposta com tributos por fora e custos adicionais."),
-        ("Custo líquido", money(result["liquid"]), "Preço equalizado após créditos recuperáveis."),
-        ("Tributos não recuperáveis", money(result["summary"].get("non_recoverable")), "Impacto direto no custo da compra."),
-    ]
-    for col, (label, value, note) in zip(kpi_cols, items):
-        col.markdown(
-            f"""
-            <div class="kpi-card">
-                <div class="kpi-label">{label}</div>
-                <div class="kpi-value">{value}</div>
-                <div class="tax-note">{note}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-
 def render_tax_cards(lines: List[TaxLine]) -> None:
     if not lines:
         return
@@ -599,7 +588,6 @@ def main() -> None:
             if result["base"] is None:
                 st.warning("Aguardando pelo menos um preço para iniciar os cálculos.")
             else:
-                render_kpis(result)
                 output_rows = [
                     ("Preço base da proposta", result["base"], "R$"),
                     ("Valor da operação", result["summary"].get("operation_value"), "R$"),
@@ -609,7 +597,7 @@ def main() -> None:
                     ("Tributos não recuperáveis", result["summary"].get("non_recoverable"), "R$"),
                     ("Diferença bruto vs líquido", result["gross"] - result["liquid"], "R$"),
                 ]
-                st.dataframe(build_editor_df(output_rows), use_container_width=True, hide_index=True)
+                st.dataframe(build_output_df(output_rows), use_container_width=True, hide_index=True)
             for warning in result["warnings"]:
                 st.warning(warning)
         st.markdown("### Tributos detalhados")
