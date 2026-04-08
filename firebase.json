@@ -1,0 +1,15 @@
+{
+  "hosting": {
+    "site": "impostos",
+    "public": "public",
+    "rewrites": [
+      {
+        "source": "**",
+        "run": {
+          "serviceId": "bidwise-git",
+          "region": "southamerica-east1"
+        }
+      }
+    ]
+  }
+}
