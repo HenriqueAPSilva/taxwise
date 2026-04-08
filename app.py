@@ -115,9 +115,13 @@ def default_rates(ctx: Context) -> Dict[str, float]:
     same_state = ctx.origin == ctx.destination and ctx.origin not in {"Internacional", "ZFM"}
     icms_internal = INTERNAL_ICMS.get(ctx.destination, 18.0)
     icms_rate = interstate_icms(ctx.origin, ctx.destination)
-    difal_rate = 0.0 if same_state or imported else max(icms_internal - icms_rate, 0.0)
+    difal_rate = 0.0
+    if material and not same_state and not imported and ctx.nature in {"Uso / consumo", "Ativo imobilizado"}:
+        difal_rate = max(icms_internal - icms_rate, 0.0)
     rates = {
         "Preço base da proposta": 1000.0, "Preço bruto da proposta": None, "Custo líquido equalizado": None,
+        "Frete (R$)": 0.0, "Seguro (R$)": 0.0, "Outras despesas (R$)": 0.0, "Desconto (R$)": 0.0,
+        "Base aduaneira (R$)": None, "MVA-ST (%)": 40.0 if material else 0.0,
         "ICMS (%)": icms_rate if material else 0.0, "IPI (%)": 5.0 if material and supplier_industry and not zfm else 0.0,
         "PIS (%)": 1.65 if material and not imported and not zfm else 0.0, "COFINS (%)": 7.60 if material and not imported and not zfm else 0.0,
         "ICMS-ST (%)": 0.0, "DIFAL (%)": difal_rate if material else 0.0, "FCP (%)": FCP_DEFAULT.get(ctx.destination, 2.0) if material and not same_state else 0.0,
@@ -126,7 +130,7 @@ def default_rates(ctx: Context) -> Dict[str, float]:
         "Despesas aduaneiras (R$)": 250.0 if imported else 0.0,
     }
     if service:
-        rates.update({"PIS (%)": 1.65, "COFINS (%)": 7.60, "ICMS (%)": 0.0, "IPI (%)": 0.0, "ICMS-ST (%)": 0.0, "DIFAL (%)": 0.0, "FCP (%)": 0.0})
+        rates.update({"PIS (%)": 1.65, "COFINS (%)": 7.60, "ICMS (%)": 0.0, "IPI (%)": 0.0, "ICMS-ST (%)": 0.0, "DIFAL (%)": 0.0, "FCP (%)": 0.0, "MVA-ST (%)": 0.0})
     if ctx.supplier_regime == "Simples Nacional":
         rates["PIS (%)"] = 0.0
         rates["COFINS (%)"] = 0.0
@@ -203,6 +207,15 @@ def credit_flags(ctx: Context) -> Dict[str, bool]:
     }
 
 
+def difal_applicable(ctx: Context) -> bool:
+    return (
+        ctx.item_type == "Material"
+        and ctx.origin not in {"Internacional", "ZFM"}
+        and ctx.origin != ctx.destination
+        and ctx.nature in {"Uso / consumo", "Ativo imobilizado"}
+    )
+
+
 def compute_taxes(ctx: Context, values: Dict[str, Optional[float]]) -> Dict[str, object]:
     base_input = values.get("Preço base da proposta")
     gross_input = values.get("Preço bruto da proposta")
@@ -210,6 +223,12 @@ def compute_taxes(ctx: Context, values: Dict[str, Optional[float]]) -> Dict[str,
     imported = ctx.origin == "Internacional"
     material = ctx.item_type == "Material"
     service = ctx.item_type == "Serviço"
+    freight = values.get("Frete (R$)") or 0.0
+    insurance = values.get("Seguro (R$)") or 0.0
+    other_expenses = values.get("Outras despesas (R$)") or 0.0
+    discount = values.get("Desconto (R$)") or 0.0
+    customs_base_override = values.get("Base aduaneira (R$)")
+    mva_st = (values.get("MVA-ST (%)") or 0.0) / 100.0
     icms = (values.get("ICMS (%)") or 0.0) / 100.0
     ipi = (values.get("IPI (%)") or 0.0) / 100.0
     pis = (values.get("PIS (%)") or 0.0) / 100.0
@@ -222,61 +241,116 @@ def compute_taxes(ctx: Context, values: Dict[str, Optional[float]]) -> Dict[str,
     pis_import = (values.get("PIS-Importação (%)") or 0.0) / 100.0
     cofins_import = (values.get("COFINS-Importação (%)") or 0.0) / 100.0
     customs_expenses = values.get("Despesas aduaneiras (R$)") or 0.0
+    allowed_diffal = difal_applicable(ctx)
     credits = credit_flags(ctx)
-    outside_rate = 0.0
-    recoverable_rate = 0.0
-    if material:
-        outside_rate += ipi + icms_st + difal + fcp
-        recoverable_rate += icms if credits["ICMS"] else 0.0
-        recoverable_rate += ipi if credits["IPI"] else 0.0
-        if imported:
-            outside_rate += ii + pis_import + cofins_import
-            recoverable_rate += pis_import if credits["PIS-Importação"] else 0.0
-            recoverable_rate += cofins_import if credits["COFINS-Importação"] else 0.0
-        else:
-            recoverable_rate += pis if credits["PIS"] else 0.0
-            recoverable_rate += cofins if credits["COFINS"] else 0.0
-    elif service:
-        outside_rate += iss
-        recoverable_rate += pis if credits["PIS"] else 0.0
-        recoverable_rate += cofins if credits["COFINS"] else 0.0
-    gross_fixed = customs_expenses if imported else 0.0
-    gross_coef = 1.0 + outside_rate
-    liquid_coef = gross_coef - recoverable_rate
+    difal_effective = difal if allowed_diffal else 0.0
+    fcp_effective = fcp if allowed_diffal else 0.0
+
+    def calculate_from_base(base_value: float) -> Dict[str, float]:
+        operation_value = max(base_value + freight + insurance + other_expenses - discount, 0.0)
+        customs_base = customs_base_override if customs_base_override is not None else operation_value
+        icms_own_base = operation_value
+        icms_own_amount = icms_own_base * icms if material else 0.0
+        ii_amount = customs_base * ii if imported and material else 0.0
+        ipi_base = operation_value + ii_amount
+        ipi_amount = ipi_base * ipi if material else 0.0
+        pis_amount = operation_value * pis if (material or service) and not imported else 0.0
+        cofins_amount = operation_value * cofins if (material or service) and not imported else 0.0
+        pis_import_base = customs_base + ii_amount + customs_expenses
+        pis_import_amount = pis_import_base * pis_import if imported and material else 0.0
+        cofins_import_amount = pis_import_base * cofins_import if imported and material else 0.0
+        icms_st_manual = operation_value * icms_st if material else 0.0
+        st_base = operation_value * (1.0 + mva_st) if material else 0.0
+        st_due = max((st_base * icms) - icms_own_amount, 0.0) if material else 0.0
+        icms_st_amount = max(icms_st_manual, st_due)
+        difal_base = operation_value
+        difal_amount = difal_base * difal_effective if material else 0.0
+        fcp_amount = difal_base * fcp_effective if material else 0.0
+        iss_amount = operation_value * iss if service else 0.0
+
+        gross = operation_value + customs_expenses + ii_amount + ipi_amount + pis_import_amount + cofins_import_amount + icms_st_amount + difal_amount + fcp_amount + iss_amount
+        recoverable_total = (
+            (icms_own_amount if credits["ICMS"] else 0.0)
+            + (ipi_amount if credits["IPI"] else 0.0)
+            + (pis_amount if credits["PIS"] else 0.0)
+            + (cofins_amount if credits["COFINS"] else 0.0)
+            + (pis_import_amount if credits["PIS-Importação"] else 0.0)
+            + (cofins_import_amount if credits["COFINS-Importação"] else 0.0)
+        )
+        liquid = gross - recoverable_total
+        return {
+            "operation_value": operation_value,
+            "customs_base": customs_base,
+            "icms_own_amount": icms_own_amount,
+            "ii_amount": ii_amount,
+            "ipi_amount": ipi_amount,
+            "pis_amount": pis_amount,
+            "cofins_amount": cofins_amount,
+            "pis_import_amount": pis_import_amount,
+            "cofins_import_amount": cofins_import_amount,
+            "icms_st_amount": icms_st_amount,
+            "st_due": st_due,
+            "difal_amount": difal_amount,
+            "fcp_amount": fcp_amount,
+            "iss_amount": iss_amount,
+            "gross": gross,
+            "liquid": liquid,
+        }
+
     inferred_bases: List[float] = []
     if base_input is not None:
         inferred_bases.append(base_input)
-    if gross_input is not None and gross_coef > 0:
-        inferred_bases.append((gross_input - gross_fixed) / gross_coef)
-    if liquid_input is not None and liquid_coef > 0:
-        inferred_bases.append((liquid_input - gross_fixed) / liquid_coef)
+    if gross_input is not None:
+        probe_base = max((gross_input - freight - insurance - other_expenses + discount), 0.0)
+        for _ in range(6):
+            probe_result = calculate_from_base(probe_base)
+            delta = gross_input - probe_result["gross"]
+            if abs(delta) < 0.01:
+                break
+            probe_base = max(probe_base + (delta * 0.85), 0.0)
+        inferred_bases.append(probe_base)
+    if liquid_input is not None:
+        probe_base = max((liquid_input - freight - insurance - other_expenses + discount), 0.0)
+        for _ in range(6):
+            probe_result = calculate_from_base(probe_base)
+            delta = liquid_input - probe_result["liquid"]
+            if abs(delta) < 0.01:
+                break
+            probe_base = max(probe_base + (delta * 0.85), 0.0)
+        inferred_bases.append(probe_base)
+
     warnings: List[str] = []
     if not inferred_bases:
         warnings.append("Preencha pelo menos um dos campos de preço para iniciar a equalização.")
         return {"base": None, "gross": None, "liquid": None, "lines": [], "warnings": warnings, "summary": {}}
+
     base = sum(inferred_bases) / len(inferred_bases)
     spread = max(inferred_bases) - min(inferred_bases)
     if len(inferred_bases) > 1 and spread > 0.05:
         warnings.append("Os preços informados não fecham exatamente entre si. A calculadora assumiu uma média implícita.")
-    icms_amount = base * icms if material else 0.0
-    ii_amount = base * ii if imported and material else 0.0
-    ipi_amount = (base + ii_amount) * ipi if material else 0.0
-    pis_amount = base * pis if not imported else 0.0
-    cofins_amount = base * cofins if not imported else 0.0
-    icms_st_amount = base * icms_st if material else 0.0
-    difal_amount = base * difal if material else 0.0
-    fcp_amount = base * fcp if material else 0.0
-    iss_amount = base * iss if service else 0.0
-    pis_import_amount = base * pis_import if imported and material else 0.0
-    cofins_import_amount = base * cofins_import if imported and material else 0.0
+
+    result_map = calculate_from_base(base)
+    operation_value = result_map["operation_value"]
+    ii_amount = result_map["ii_amount"]
+    icms_amount = result_map["icms_own_amount"]
+    ipi_amount = result_map["ipi_amount"]
+    pis_amount = result_map["pis_amount"]
+    cofins_amount = result_map["cofins_amount"]
+    icms_st_amount = result_map["icms_st_amount"]
+    difal_amount = result_map["difal_amount"]
+    fcp_amount = result_map["fcp_amount"]
+    iss_amount = result_map["iss_amount"]
+    pis_import_amount = result_map["pis_import_amount"]
+    cofins_import_amount = result_map["cofins_import_amount"]
+
     lines: List[TaxLine] = []
     if material:
         lines.extend([
-            TaxLine("ICMS", icms_amount, icms_amount if credits["ICMS"] else 0.0, icms_amount if not credits["ICMS"] else 0.0, "Tratado como tributo embutido no preço base."),
-            TaxLine("IPI", ipi_amount, ipi_amount if credits["IPI"] else 0.0, ipi_amount if not credits["IPI"] else 0.0, "No MVP, o IPI entra como tributo por fora."),
-            TaxLine("ICMS-ST", icms_st_amount, 0.0, icms_st_amount, "Mantido como custo não recuperável por padrão."),
-            TaxLine("DIFAL", difal_amount, 0.0, difal_amount, "Diferença simplificada entre alíquota interna e interestadual."),
-            TaxLine("FCP", fcp_amount, 0.0, fcp_amount, "Adicional por fora em cenário interestadual simplificado."),
+            TaxLine("ICMS", icms_amount, icms_amount if credits["ICMS"] else 0.0, icms_amount if not credits["ICMS"] else 0.0, "Calculado sobre o valor da operação (produto + frete + despesas - desconto)."),
+            TaxLine("IPI", ipi_amount, ipi_amount if credits["IPI"] else 0.0, ipi_amount if not credits["IPI"] else 0.0, "Base simplificada do IPI considera valor da operação e II quando importado."),
+            TaxLine("ICMS-ST", icms_st_amount, 0.0, icms_st_amount, "A calculadora usa o maior entre ST manual e ST estimado por MVA."),
+            TaxLine("DIFAL", difal_amount, 0.0, difal_amount, "Aplicado apenas em operação interestadual de uso/consumo ou ativo imobilizado."),
+            TaxLine("FCP", fcp_amount, 0.0, fcp_amount, "FCP segue a mesma elegibilidade do DIFAL no modelo."),
         ])
         if imported:
             lines.extend([
@@ -297,8 +371,8 @@ def compute_taxes(ctx: Context, values: Dict[str, Optional[float]]) -> Dict[str,
         ])
     total_recoverable = sum(line.recoverable for line in lines)
     total_non_recoverable = sum(line.non_recoverable for line in lines)
-    gross = base * gross_coef + gross_fixed
-    liquid = gross - total_recoverable
+    gross = result_map["gross"]
+    liquid = result_map["liquid"]
     if ctx.supplier_regime == "Simples Nacional":
         warnings.append("Fornecedor no Simples Nacional reduz ou elimina créditos no MVP. Valide o cenário real antes da decisão final.")
     if ctx.nature == "Uso / consumo":
@@ -309,13 +383,23 @@ def compute_taxes(ctx: Context, values: Dict[str, Optional[float]]) -> Dict[str,
         warnings.append("ZFM foi modelada com regra geral simplificada. O benefício efetivo pode variar por produto e destinatário.")
     if material and not ctx.ncm.strip():
         warnings.append("NCM é opcional neste MVP, mas recomendado para calibrar IPI, ST e benefícios com mais segurança.")
+    if discount > (base + freight + insurance + other_expenses):
+        warnings.append("Desconto maior do que o valor da operação gera base tributável zerada no modelo.")
+    if material and not allowed_diffal and (difal > 0 or fcp > 0):
+        warnings.append("DIFAL/FCP informados, mas a operação atual não se enquadra na regra simplificada aplicada.")
+
     return {
         "base": base,
         "gross": gross,
         "liquid": liquid,
         "lines": lines,
         "warnings": warnings,
-        "summary": {"recoverable": total_recoverable, "non_recoverable": total_non_recoverable, "gross_delta": gross - base},
+        "summary": {
+            "recoverable": total_recoverable,
+            "non_recoverable": total_non_recoverable,
+            "gross_delta": gross - base,
+            "operation_value": operation_value,
+        },
     }
 
 
@@ -385,9 +469,11 @@ def explanation_tab(ctx: Context, values: Dict[str, Optional[float]]) -> None:
     )
     bullets = [
         f"**ICMS:** calculado pela UF de origem e destino. Operação {ctx.origin} → {ctx.destination}.",
+        "**Valor da operação:** usa preço base + frete + seguro + outras despesas - desconto como base principal dos tributos.",
         "**IPI:** tratado como tributo por fora no comparativo de material, com crédito em cenários gerais elegíveis.",
         "**PIS/COFINS:** entram como crédito simplificado no regime não cumulativo, exceto quando a natureza bloqueia o crédito ou o fornecedor está no Simples.",
-        "**ICMS-ST, DIFAL e FCP:** entram como custo adicional por fora, com abordagem simplificada para apoiar decisão de compra.",
+        "**ICMS-ST:** usa maior valor entre alíquota manual e estimativa por MVA para reduzir subestimação de custo.",
+        "**DIFAL e FCP:** aplicados no modelo apenas quando há operação interestadual para uso/consumo ou ativo imobilizado.",
         "**Importação:** quando marcada, a tela habilita II, PIS-Importação, COFINS-Importação e despesas aduaneiras.",
         "**ZFM:** usa defaults conservadores e mostra alerta porque o benefício depende do enquadramento real da operação.",
     ]
@@ -397,13 +483,13 @@ def explanation_tab(ctx: Context, values: Dict[str, Optional[float]]) -> None:
     detail_rows = [
         ["ICMS", "Valor embutido no preço base. Se elegível, reduz o custo líquido como crédito."],
         ["IPI", "Adicionado por fora na proposta e, quando recuperável, abatido do custo líquido."],
-        ["PIS / COFINS", "No modelo doméstico, entram principalmente pela ótica do crédito recuperável."],
+        ["PIS / COFINS", "No modelo doméstico, incidem no valor da operação e entram na equalização via crédito recuperável."],
         ["ISS", "Para serviço, tratado como custo por fora no preço bruto."],
-        ["ICMS-ST", "Mantido como custo não recuperável no MVP."],
-        ["DIFAL / FCP", "Tratados como adicionais de aquisição em operações interestaduais simplificadas."],
+        ["ICMS-ST", "Calculado pelo maior entre ST manual e ST estimado por MVA, sempre como custo não recuperável no MVP."],
+        ["DIFAL / FCP", "Aplicados apenas no cenário simplificado de interestadual com natureza de uso/consumo ou ativo."],
         ["II", "Custo não recuperável da importação."],
-        ["PIS-Importação / COFINS-Importação", "Entram por fora e podem gerar crédito em cenário geral de Lucro Real."],
-        ["Despesas aduaneiras", "Acrescentadas diretamente ao preço bruto e ao custo líquido."],
+        ["PIS-Importação / COFINS-Importação", "Base simplificada: base aduaneira + II + despesas aduaneiras; podem gerar crédito no Lucro Real."],
+        ["Despesas aduaneiras", "Entram no preço bruto e no custo líquido; quando informado, podem compor também a base de importação."],
     ]
     st.table(pd.DataFrame(detail_rows, columns=["Tributo", "Tratamento no MVP"]))
     st.markdown("### Premissas relevantes deste cenário")
@@ -462,12 +548,17 @@ def main() -> None:
         ("Preço base da proposta", defaults["Preço base da proposta"], "R$"),
         ("Preço bruto da proposta", defaults["Preço bruto da proposta"], "R$"),
         ("Custo líquido equalizado", defaults["Custo líquido equalizado"], "R$"),
+        ("Frete (R$)", defaults["Frete (R$)"], "R$"),
+        ("Seguro (R$)", defaults["Seguro (R$)"], "R$"),
+        ("Outras despesas (R$)", defaults["Outras despesas (R$)"], "R$"),
+        ("Desconto (R$)", defaults["Desconto (R$)"], "R$"),
     ]
     rate_rows = [
         ("ICMS (%)", defaults["ICMS (%)"], "%"),
         ("IPI (%)", defaults["IPI (%)"], "%"),
         ("PIS (%)", defaults["PIS (%)"], "%"),
         ("COFINS (%)", defaults["COFINS (%)"], "%"),
+        ("MVA-ST (%)", defaults["MVA-ST (%)"], "%"),
         ("ICMS-ST (%)", defaults["ICMS-ST (%)"], "%"),
         ("DIFAL (%)", defaults["DIFAL (%)"], "%"),
         ("FCP (%)", defaults["FCP (%)"], "%"),
@@ -479,6 +570,7 @@ def main() -> None:
             ("PIS-Importação (%)", defaults["PIS-Importação (%)"], "%"),
             ("COFINS-Importação (%)", defaults["COFINS-Importação (%)"], "%"),
             ("Despesas aduaneiras (R$)", defaults["Despesas aduaneiras (R$)"], "R$"),
+            ("Base aduaneira (R$)", defaults["Base aduaneira (R$)"], "R$"),
         ])
     price_df = merge_editor_state("price_editor_store", build_editor_df(price_rows))
     rate_df = merge_editor_state("rate_editor_store", build_editor_df(rate_rows))
@@ -510,6 +602,7 @@ def main() -> None:
                 render_kpis(result)
                 output_rows = [
                     ("Preço base da proposta", result["base"], "R$"),
+                    ("Valor da operação", result["summary"].get("operation_value"), "R$"),
                     ("Preço bruto da proposta", result["gross"], "R$"),
                     ("Custo líquido equalizado", result["liquid"], "R$"),
                     ("Tributos recuperáveis", result["summary"].get("recoverable"), "R$"),
