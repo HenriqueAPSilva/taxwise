@@ -1,7 +1,8 @@
 {
   "hosting": {
-    "target": "impostos",
+    "site": "impostos",
     "public": "public",
+"trailingSlash": false,
     "rewrites": [
       {
         "source": "**",
